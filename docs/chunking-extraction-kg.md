@@ -38,7 +38,26 @@ These markers are treated as section boundaries so chunks do not blend unrelated
 - Oversized sentences/paragraphs are split with `split_long_paragraph()` as a fail-safe.
 - Chunk overlap is sentence-level (`overlap_sentences=2`) instead of raw character tails.
 
-### 4. Relevance filtering before extraction
+### 4. Semantic unit chunk building
+
+`build_semantic_chunks_from_section()` adds a second chunk stream at a coarser semantic level:
+
+- `split_into_semantic_units()` groups text into paragraph-like units (split on blank lines and structural markers).
+- Chunks are built from these units with light overlap (`overlap_units=1`).
+- `should_start_new_semantic_chunk()` introduces boundaries when topic overlap drops after a minimum chunk size.
+- Very long units are still split with `split_long_paragraph()`.
+
+This complements sentence chunking by preserving larger topical blocks that may span many sentences.
+
+### 5. Hybrid merge and de-duplication
+
+`merge_chunk_variants()` combines sentence chunks and semantic chunks into one final list:
+
+- sentence chunks are kept as the base,
+- semantic chunks are appended only when `is_redundant_chunk()` says they are meaningfully distinct,
+- near-duplicates are filtered using normalized text match, containment ratio, and token-overlap checks.
+
+### 6. Relevance filtering before extraction
 
 `score_chunk_relevance(chunk_text)` computes a low-cost quality score using:
 
@@ -61,6 +80,8 @@ Extraction runs in `extract_knowledge(text, chunk_size=3000)` in [extractor.py](
 5. Attach provenance to each extracted object:
    - `source_chunk`
    - `source_excerpt` (from model evidence when available, otherwise chunk prefix)
+   - `source_page` (when `[Page N]` marker is present)
+   - `source_marker` (for `[Page N]`, `[Slide N]`, or `[Sheet: ...]`)
 6. Post-process:
    - `deduplicate_entities()` (name-normalized dedup)
    - `normalize_and_deduplicate_relations()` (canonical subject/object mapping + tuple dedup)
@@ -80,6 +101,10 @@ Provenance columns used for evidence traceability:
 
 - `source_chunk`
 - `source_excerpt`
+- `source_page`
+- `source_marker`
+
+These fields are used by proof-mode responses to generate clearer citations, including direct file links and PDF page-aware links when available.
 
 ### Canonical linking tables
 
@@ -122,6 +147,8 @@ If you want to tune behavior, start with these values in [extractor.py](../extra
 - `chunk_size` in `extract_knowledge()`
 - sentence overlap count (`overlap_sentences`)
 - lexical-overlap threshold in `should_start_new_chunk()`
+- semantic overlap count (`overlap_units`)
+- lexical-overlap threshold in `should_start_new_semantic_chunk()`
 - relevance cutoff in `extract_knowledge()` for `score_chunk_relevance()`
 
 For cross-document linking in [knowledge_graph.py](../knowledge_graph.py), tune:

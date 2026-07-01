@@ -60,6 +60,7 @@ def extract_knowledge(text, chunk_size=3000):
 
     for i, chunk in enumerate(chunks):
         chunk_text = chunk["text"]
+        source_page, source_marker = detect_source_marker(chunk_text)
         if len(chunk_text.strip()) < 50:
             continue
         relevance = score_chunk_relevance(chunk_text)
@@ -74,9 +75,13 @@ def extract_knowledge(text, chunk_size=3000):
         for entity in entities:
             entity["source_chunk"] = chunk["chunk_index"]
             entity["source_excerpt"] = entity.get("evidence") or chunk_text[:300]
+            entity["source_page"] = source_page
+            entity["source_marker"] = source_marker
         for relation in relations:
             relation["source_chunk"] = chunk["chunk_index"]
             relation["source_excerpt"] = relation.get("evidence") or chunk_text[:300]
+            relation["source_page"] = source_page
+            relation["source_marker"] = source_marker
         all_entities.extend(entities)
         all_relations.extend(relations)
         if lang != "en":
@@ -166,12 +171,64 @@ def split_into_chunks(text, chunk_size):
     sections = split_into_sections(normalized)
     chunks = []
     overlap_sentences = 2
+    overlap_units = 1
 
     for section in sections:
-        section_chunks = build_chunks_from_section(section, chunk_size, overlap_sentences)
+        sentence_chunks = build_chunks_from_section(section, chunk_size, overlap_sentences)
+        semantic_chunks = build_semantic_chunks_from_section(section, chunk_size, overlap_units)
+        section_chunks = merge_chunk_variants(sentence_chunks, semantic_chunks)
         chunks.extend(section_chunks)
 
     return [{"chunk_index": i, "text": c} for i, c in enumerate(chunks)]
+
+
+def merge_chunk_variants(sentence_chunks, semantic_chunks):
+    merged = []
+    for chunk in sentence_chunks:
+        chunk_text = chunk.strip()
+        if chunk_text:
+            merged.append(chunk_text)
+
+    for chunk in semantic_chunks:
+        chunk_text = chunk.strip()
+        if not chunk_text:
+            continue
+        if is_redundant_chunk(chunk_text, merged):
+            continue
+        merged.append(chunk_text)
+
+    return merged
+
+
+def is_redundant_chunk(candidate, existing_chunks):
+    candidate_norm = normalize_chunk_text(candidate)
+    if not candidate_norm:
+        return True
+
+    candidate_tokens = lexical_tokens(candidate_norm)
+    for existing in existing_chunks:
+        existing_norm = normalize_chunk_text(existing)
+        if candidate_norm == existing_norm:
+            return True
+        if candidate_norm in existing_norm or existing_norm in candidate_norm:
+            shorter = min(len(candidate_norm), len(existing_norm))
+            longer = max(len(candidate_norm), len(existing_norm))
+            if shorter / max(longer, 1) > 0.8:
+                return True
+
+        existing_tokens = lexical_tokens(existing_norm)
+        if not candidate_tokens or not existing_tokens:
+            continue
+        overlap = len(candidate_tokens.intersection(existing_tokens)) / max(len(candidate_tokens), 1)
+        if overlap > 0.92:
+            return True
+
+    return False
+
+
+def normalize_chunk_text(text):
+    value = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    return value
 
 
 def deduplicate_entities(entities):
@@ -314,6 +371,90 @@ def build_chunks_from_section(section_text, chunk_size, overlap_sentences=2):
     return [c for c in chunks if c]
 
 
+def build_semantic_chunks_from_section(section_text, chunk_size, overlap_units=1):
+    semantic_units = split_into_semantic_units(section_text)
+    if not semantic_units:
+        return [section_text]
+
+    chunks = []
+    current_units = []
+    current_len = 0
+    current_tokens = set()
+
+    for unit in semantic_units:
+        if len(unit) > chunk_size:
+            for part in split_long_paragraph(unit, chunk_size):
+                if current_units:
+                    chunks.append(" ".join(current_units).strip())
+                    current_units = []
+                    current_len = 0
+                    current_tokens = set()
+                chunks.append(part.strip())
+            continue
+
+        unit_tokens = lexical_tokens(unit)
+        should_break = current_units and (
+            current_len + len(unit) + 1 > chunk_size
+            or should_start_new_semantic_chunk(current_tokens, unit_tokens, current_len, chunk_size)
+        )
+
+        if should_break:
+            chunks.append(" ".join(current_units).strip())
+            carry = current_units[-overlap_units:] if overlap_units > 0 else []
+            current_units = list(carry)
+            current_len = sum(len(u) + 1 for u in current_units)
+            current_tokens = lexical_tokens(" ".join(current_units)) if current_units else set()
+
+        current_units.append(unit)
+        current_len += len(unit) + 1
+        current_tokens.update(unit_tokens)
+
+    if current_units:
+        chunks.append(" ".join(current_units).strip())
+
+    return [c for c in chunks if c]
+
+
+def split_into_semantic_units(text):
+    lines = text.split("\n")
+    units = []
+    current = []
+
+    def flush_current():
+        if not current:
+            return
+        value = " ".join(current).strip()
+        if value:
+            units.append(value)
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            flush_current()
+            current = []
+            continue
+
+        if is_structure_marker(line):
+            flush_current()
+            current = []
+            units.append(line)
+            continue
+
+        current.append(line)
+
+    flush_current()
+    return units
+
+
+def should_start_new_semantic_chunk(current_tokens, next_tokens, current_len, chunk_size):
+    if current_len < max(900, int(chunk_size * 0.4)):
+        return False
+    if not current_tokens or not next_tokens:
+        return False
+    overlap = len(current_tokens.intersection(next_tokens)) / max(len(next_tokens), 1)
+    return overlap < 0.06
+
+
 def split_into_sentences(text):
     parts = re.split(r"(?<=[.!?])\s+", text)
     return [p.strip() for p in parts if p.strip()]
@@ -389,3 +530,26 @@ def normalize_and_deduplicate_relations(relations, entities):
                 deduped[key] = relation
 
     return list(deduped.values())
+
+
+def detect_source_marker(chunk_text):
+    page = None
+    marker = ""
+
+    page_match = re.search(r"\[Page\s+(\d+)\]", chunk_text)
+    if page_match:
+        page = int(page_match.group(1))
+        marker = page_match.group(0)
+        return page, marker
+
+    slide_match = re.search(r"\[Slide\s+(\d+)\]", chunk_text)
+    if slide_match:
+        marker = slide_match.group(0)
+        return page, marker
+
+    sheet_match = re.search(r"\[Sheet:\s+([^\]]+)\]", chunk_text)
+    if sheet_match:
+        marker = f"[Sheet: {sheet_match.group(1).strip()}]"
+        return page, marker
+
+    return page, marker

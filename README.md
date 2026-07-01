@@ -88,10 +88,15 @@ Opens in your browser at `http://localhost:8501`
 
 ## Usage
 
-1. **Ingest Documents**: Click "Ingest All Documents" in the sidebar. This parses, translates (if German), extracts knowledge, and stores it.
+1. **Ingest Documents**: Click "Ingest All Documents" in the sidebar. This parses, chunks text using sentence + semantic segmentation, translates (if German), extracts knowledge, and stores it.
 2. **Ask Questions**: Type your question in the chat input. The app searches the knowledge graph and generates an answer.
+     - For document proof, include terms like "proof", "evidence", "citation", or "source" in your question.
+     - The response appends a **PROOF FROM ORIGINAL DOCUMENTS** section with clickable file links.
+     - For PDFs, citations include page-aware links (for example, `file.pdf p.12`).
 3. **Filter by Domain**: Use the sidebar dropdown to limit answers to a specific domain folder.
 4. **Check Stats**: The sidebar shows how many entities and relations were extracted per domain.
+
+If your data was ingested before this citation update, run **Re-ingest All Documents** once to populate precise source markers/page metadata.
 
 ## Switching LLM Providers
 

@@ -157,12 +157,29 @@ def format_evidence(excerpt):
 
 
 def format_source_label(item):
-    source_file = item.get("source_file", "")
+    citation = format_citation(item)
     domain = item.get("domain", "unknown")
     chunk = item.get("source_chunk")
-    file_name = os.path.basename(source_file) if source_file else "unknown"
     chunk_label = f", chunk {chunk}" if chunk is not None else ""
-    return f"[domain: {domain}, file: {file_name}{chunk_label}]"
+    marker = item.get("source_marker", "")
+    marker_label = f", marker: {marker}" if marker else ""
+    return f"[domain: {domain}, source: {citation}{chunk_label}{marker_label}]"
+
+
+def format_citation(item):
+    source_file = item.get("source_file", "")
+    if not source_file:
+        return "unknown"
+
+    file_name = os.path.basename(source_file)
+    page = item.get("source_page")
+    marker = item.get("source_marker", "")
+
+    if page and str(source_file).lower().endswith(".pdf"):
+        return f"[{file_name} p.{page}](file://{source_file}#page={page})"
+    if marker:
+        return f"[{file_name} {marker}](file://{source_file})"
+    return f"[{file_name}](file://{source_file})"
 
 
 def needs_proof(question):
@@ -181,6 +198,7 @@ def build_proof_section(question, entities, relations):
             "kind": "entity",
             "label": e.get("name", ""),
             "source": format_source_label(e),
+            "citation": format_citation(e),
             "evidence": format_evidence(e.get("source_excerpt", "")),
         })
     for r in relations[:8]:
@@ -188,6 +206,7 @@ def build_proof_section(question, entities, relations):
             "kind": "relation",
             "label": f"{r.get('subject', '')} --[{r.get('predicate', '')}]--> {r.get('object', '')}",
             "source": format_source_label(r),
+            "citation": format_citation(r),
             "evidence": format_evidence(r.get("source_excerpt", "")),
         })
 
@@ -202,7 +221,9 @@ def build_proof_section(question, entities, relations):
         if not item["evidence"]:
             continue
         count += 1
-        lines.append(f"{count}. {item['label']} {item['source']}")
+        lines.append(f"{count}. {item['label']}")
+        lines.append(f"   source: {item['citation']}")
+        lines.append(f"   details: {item['source']}")
         lines.append(f"   \"{item['evidence']}\"")
         if count >= 8:
             break

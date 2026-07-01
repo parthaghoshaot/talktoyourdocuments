@@ -32,6 +32,8 @@ def init_db():
             description_translated TEXT,
             source_chunk INTEGER,
             source_excerpt TEXT,
+            source_page INTEGER,
+            source_marker TEXT,
             language TEXT NOT NULL DEFAULT 'en',
             domain TEXT NOT NULL,
             source_file TEXT NOT NULL
@@ -48,6 +50,8 @@ def init_db():
             context_translated TEXT,
             source_chunk INTEGER,
             source_excerpt TEXT,
+            source_page INTEGER,
+            source_marker TEXT,
             language TEXT NOT NULL DEFAULT 'en',
             domain TEXT NOT NULL,
             source_file TEXT NOT NULL
@@ -83,8 +87,12 @@ def init_db():
     """)
     ensure_column(conn, "entities", "source_chunk", "INTEGER")
     ensure_column(conn, "entities", "source_excerpt", "TEXT")
+    ensure_column(conn, "entities", "source_page", "INTEGER")
+    ensure_column(conn, "entities", "source_marker", "TEXT")
     ensure_column(conn, "relations", "source_chunk", "INTEGER")
     ensure_column(conn, "relations", "source_excerpt", "TEXT")
+    ensure_column(conn, "relations", "source_page", "INTEGER")
+    ensure_column(conn, "relations", "source_marker", "TEXT")
     conn.commit()
     conn.close()
 
@@ -116,7 +124,7 @@ def store_document(path, domain, file_hash):
 def store_entities(entities, domain, source_file, language="en"):
     conn = get_connection()
     conn.executemany(
-        "INSERT INTO entities (name, name_translated, entity_type, description, description_translated, source_chunk, source_excerpt, language, domain, source_file) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO entities (name, name_translated, entity_type, description, description_translated, source_chunk, source_excerpt, source_page, source_marker, language, domain, source_file) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [(
             e["name"],
             e.get("name_translated", ""),
@@ -125,6 +133,8 @@ def store_entities(entities, domain, source_file, language="en"):
             e.get("description_translated", ""),
             e.get("source_chunk"),
             e.get("source_excerpt", ""),
+            e.get("source_page"),
+            e.get("source_marker", ""),
             language,
             domain,
             source_file,
@@ -137,7 +147,7 @@ def store_entities(entities, domain, source_file, language="en"):
 def store_relations(relations, domain, source_file, language="en"):
     conn = get_connection()
     conn.executemany(
-        "INSERT INTO relations (subject, subject_translated, predicate, object, object_translated, context, context_translated, source_chunk, source_excerpt, language, domain, source_file) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO relations (subject, subject_translated, predicate, object, object_translated, context, context_translated, source_chunk, source_excerpt, source_page, source_marker, language, domain, source_file) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [(
             r["subject"],
             r.get("subject_translated", ""),
@@ -148,6 +158,8 @@ def store_relations(relations, domain, source_file, language="en"):
             r.get("context_translated", ""),
             r.get("source_chunk"),
             r.get("source_excerpt", ""),
+            r.get("source_page"),
+            r.get("source_marker", ""),
             language,
             domain,
             source_file,
