@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+.env
+knowledge.db*
+.DS_Store
+
+# Binary/source artifacts
+*.pdf
+
+# Current folder containing PDFs
+ubuy/
