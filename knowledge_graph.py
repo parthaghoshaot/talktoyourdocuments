@@ -76,6 +76,18 @@ def init_db():
             FOREIGN KEY (canonical_id) REFERENCES canonical_entities(id)
         );
 
+        CREATE TABLE IF NOT EXISTS content_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            domain TEXT NOT NULL,
+            source_file_a TEXT NOT NULL,
+            chunk_a INTEGER,
+            source_file_b TEXT NOT NULL,
+            chunk_b INTEGER,
+            link_type TEXT NOT NULL,
+            description TEXT,
+            confidence REAL DEFAULT 1.0
+        );
+
         CREATE INDEX IF NOT EXISTS idx_entities_domain ON entities(domain);
         CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
         CREATE INDEX IF NOT EXISTS idx_relations_domain ON relations(domain);
@@ -84,15 +96,18 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_documents_domain ON documents(domain);
         CREATE INDEX IF NOT EXISTS idx_canonical_entities_domain ON canonical_entities(domain);
         CREATE INDEX IF NOT EXISTS idx_entity_aliases_canonical_id ON entity_aliases(canonical_id);
+        CREATE INDEX IF NOT EXISTS idx_content_links_domain ON content_links(domain);
     """)
     ensure_column(conn, "entities", "source_chunk", "INTEGER")
     ensure_column(conn, "entities", "source_excerpt", "TEXT")
     ensure_column(conn, "entities", "source_page", "INTEGER")
     ensure_column(conn, "entities", "source_marker", "TEXT")
+    ensure_column(conn, "entities", "confidence", "REAL DEFAULT 1.0")
     ensure_column(conn, "relations", "source_chunk", "INTEGER")
     ensure_column(conn, "relations", "source_excerpt", "TEXT")
     ensure_column(conn, "relations", "source_page", "INTEGER")
     ensure_column(conn, "relations", "source_marker", "TEXT")
+    ensure_column(conn, "relations", "confidence", "REAL DEFAULT 1.0")
     conn.commit()
     conn.close()
 
@@ -124,7 +139,7 @@ def store_document(path, domain, file_hash):
 def store_entities(entities, domain, source_file, language="en"):
     conn = get_connection()
     conn.executemany(
-        "INSERT INTO entities (name, name_translated, entity_type, description, description_translated, source_chunk, source_excerpt, source_page, source_marker, language, domain, source_file) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO entities (name, name_translated, entity_type, description, description_translated, source_chunk, source_excerpt, source_page, source_marker, confidence, language, domain, source_file) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [(
             e["name"],
             e.get("name_translated", ""),
@@ -135,6 +150,7 @@ def store_entities(entities, domain, source_file, language="en"):
             e.get("source_excerpt", ""),
             e.get("source_page"),
             e.get("source_marker", ""),
+            e.get("confidence", 1.0),
             language,
             domain,
             source_file,
@@ -147,7 +163,7 @@ def store_entities(entities, domain, source_file, language="en"):
 def store_relations(relations, domain, source_file, language="en"):
     conn = get_connection()
     conn.executemany(
-        "INSERT INTO relations (subject, subject_translated, predicate, object, object_translated, context, context_translated, source_chunk, source_excerpt, source_page, source_marker, language, domain, source_file) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO relations (subject, subject_translated, predicate, object, object_translated, context, context_translated, source_chunk, source_excerpt, source_page, source_marker, confidence, language, domain, source_file) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [(
             r["subject"],
             r.get("subject_translated", ""),
@@ -160,6 +176,7 @@ def store_relations(relations, domain, source_file, language="en"):
             r.get("source_excerpt", ""),
             r.get("source_page"),
             r.get("source_marker", ""),
+            r.get("confidence", 1.0),
             language,
             domain,
             source_file,
@@ -224,6 +241,29 @@ def get_domain_stats():
     return stats
 
 
+def store_content_links(links, domain):
+    if not links:
+        return
+    conn = get_connection()
+    conn.executemany(
+        "INSERT INTO content_links (domain, source_file_a, chunk_a, source_file_b, chunk_b, link_type, description, confidence) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [(domain, l["file_a"], l.get("chunk_a"), l["file_b"], l.get("chunk_b"),
+          l["link_type"], l.get("description", ""), l.get("confidence", 1.0)) for l in links]
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_content_links(domain=None):
+    conn = get_connection()
+    if domain:
+        rows = conn.execute("SELECT * FROM content_links WHERE domain = ?", (domain,)).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM content_links").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def clear_domain(domain):
     conn = get_connection()
     conn.execute(
@@ -231,6 +271,7 @@ def clear_domain(domain):
         (domain,),
     )
     conn.execute("DELETE FROM canonical_entities WHERE domain = ?", (domain,))
+    conn.execute("DELETE FROM content_links WHERE domain = ?", (domain,))
     conn.execute("DELETE FROM entities WHERE domain = ?", (domain,))
     conn.execute("DELETE FROM relations WHERE domain = ?", (domain,))
     conn.execute("DELETE FROM documents WHERE domain = ?", (domain,))
@@ -242,6 +283,7 @@ def clear_all():
     conn = get_connection()
     conn.execute("DELETE FROM entity_aliases")
     conn.execute("DELETE FROM canonical_entities")
+    conn.execute("DELETE FROM content_links")
     conn.execute("DELETE FROM entities")
     conn.execute("DELETE FROM relations")
     conn.execute("DELETE FROM documents")

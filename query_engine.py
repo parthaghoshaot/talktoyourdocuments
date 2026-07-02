@@ -1,5 +1,5 @@
 from config import llm_chat
-from knowledge_graph import search_entities, search_relations
+from knowledge_graph import search_entities, search_relations, get_content_links
 import os
 import re
 
@@ -44,6 +44,20 @@ def build_context(question, domain=None):
                 f"  - {r['subject']} --[{r['predicate']}]--> {r['object']}: {r.get('context', '')} {source}"
                 + (f"\n    evidence: \"{proof}\"" if proof else "")
             )
+
+    content_links = get_content_links(domain)
+    if content_links:
+        relevant_links = [l for l in content_links if any(
+            kw in l.get("description", "").lower() for kw in keywords
+        )][:10]
+        if relevant_links:
+            context_parts.append("\nCROSS-REFERENCES:")
+            for link in relevant_links:
+                context_parts.append(
+                    f"  - {link['description']} [{link['link_type']}]: "
+                    f"{os.path.basename(link['source_file_a'])} chunk {link['chunk_a']} <-> "
+                    f"{os.path.basename(link['source_file_b'])} chunk {link['chunk_b']}"
+                )
 
     if not context_parts:
         context_parts.append("No relevant information found in the knowledge graph for this query.")
@@ -102,18 +116,15 @@ def rank_entities(question, entities):
     q_tokens = tokenize(question)
     scored = []
     for item in entities:
-        text = " ".join(
-            [
-                item.get("name", ""),
-                item.get("name_translated", ""),
-                item.get("description", ""),
-                item.get("description_translated", ""),
-                item.get("source_excerpt", ""),
-            ]
-        )
+        text = " ".join([
+            item.get("name", ""), item.get("name_translated", ""),
+            item.get("description", ""), item.get("description_translated", ""),
+            item.get("source_excerpt", ""),
+        ])
         score = overlap_score(q_tokens, tokenize(text))
         if item.get("source_excerpt"):
             score += 1
+        score += (item.get("confidence") or 1.0) * 2
         scored.append((score, item))
     scored.sort(key=lambda x: x[0], reverse=True)
     return [item for _, item in scored]
@@ -123,21 +134,16 @@ def rank_relations(question, relations):
     q_tokens = tokenize(question)
     scored = []
     for item in relations:
-        text = " ".join(
-            [
-                item.get("subject", ""),
-                item.get("subject_translated", ""),
-                item.get("predicate", ""),
-                item.get("object", ""),
-                item.get("object_translated", ""),
-                item.get("context", ""),
-                item.get("context_translated", ""),
-                item.get("source_excerpt", ""),
-            ]
-        )
+        text = " ".join([
+            item.get("subject", ""), item.get("subject_translated", ""),
+            item.get("predicate", ""), item.get("object", ""),
+            item.get("object_translated", ""), item.get("context", ""),
+            item.get("context_translated", ""), item.get("source_excerpt", ""),
+        ])
         score = overlap_score(q_tokens, tokenize(text))
         if item.get("source_excerpt"):
             score += 1
+        score += (item.get("confidence") or 1.0) * 2
         scored.append((score, item))
     scored.sort(key=lambda x: x[0], reverse=True)
     return [item for _, item in scored]

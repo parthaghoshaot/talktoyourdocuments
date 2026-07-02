@@ -2,7 +2,43 @@ import os
 import logging
 from dotenv import load_dotenv
 
-load_dotenv()
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+TALKTODATA_HOME = os.getenv("TALKTODATA_HOME", "").strip()
+
+
+def resolve_env_path():
+    if TALKTODATA_HOME:
+        return os.path.join(TALKTODATA_HOME, ".env")
+    return os.path.join(PROJECT_ROOT, ".env")
+
+
+def resolve_documents_dir():
+    explicit = os.getenv("DOCUMENTS_DIR", "").strip()
+    if explicit:
+        return explicit
+    if TALKTODATA_HOME:
+        return os.path.join(TALKTODATA_HOME, "documents")
+    return PROJECT_ROOT
+
+
+def resolve_db_path():
+    explicit = os.getenv("DB_PATH", "").strip()
+    if explicit:
+        return explicit
+    if TALKTODATA_HOME:
+        return os.path.join(TALKTODATA_HOME, "knowledge.db")
+    return os.path.join(PROJECT_ROOT, "knowledge.db")
+
+
+def ensure_runtime_paths(documents_dir, db_path):
+    os.makedirs(documents_dir, exist_ok=True)
+    db_parent = os.path.dirname(db_path)
+    if db_parent:
+        os.makedirs(db_parent, exist_ok=True)
+
+
+ENV_PATH = resolve_env_path()
+load_dotenv(ENV_PATH)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,8 +56,10 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
 
-DOCUMENTS_DIR = os.getenv("DOCUMENTS_DIR", os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge.db"))
+DOCUMENTS_DIR = resolve_documents_dir()
+DB_PATH = resolve_db_path()
+ensure_runtime_paths(DOCUMENTS_DIR, DB_PATH)
+logger.info(f"Runtime paths: env={ENV_PATH}, documents={DOCUMENTS_DIR}, db={DB_PATH}")
 
 _llm_client = None
 
@@ -93,3 +131,36 @@ def llm_chat(messages, system_prompt=None):
         else:
             logger.info("LLM response <- (no token usage reported)")
         return response.text
+
+
+def llm_describe_image(image_bytes, mime_type="image/png", context=""):
+    import base64
+    client = get_llm_client()
+    prompt = (
+        "Describe this image in detail for knowledge extraction. "
+        "Include all text, labels, data, relationships, and visual structure. "
+        "If it's a diagram or chart, describe the entities and connections."
+    )
+    if context:
+        prompt += f" Context from surrounding document: {context[:500]}"
+
+    logger.info(f"Vision LLM call -> provider={LLM_PROVIDER}")
+
+    if LLM_PROVIDER in ("openai", "ollama"):
+        model = OPENAI_MODEL if LLM_PROVIDER == "openai" else OLLAMA_MODEL
+        b64 = base64.b64encode(image_bytes).decode()
+        msgs = [{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}},
+        ]}]
+        response = client.chat.completions.create(model=model, messages=msgs, temperature=0.2, max_tokens=1000)
+        return response.choices[0].message.content
+
+    elif LLM_PROVIDER == "gemini":
+        from google.genai.types import Part
+        b64 = base64.b64encode(image_bytes).decode()
+        parts = [prompt, Part(inline_data={"mime_type": mime_type, "data": b64})]
+        response = client.models.generate_content(model=GEMINI_MODEL, contents=parts)
+        return response.text
+
+    return ""

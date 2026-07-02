@@ -15,7 +15,8 @@ Return ONLY valid JSON in this exact format:
             "name": "Entity Name",
             "type": "Person|Organization|Process|Document|Concept|Location|Product|Event|Other",
             "description": "Brief description",
-            "evidence": "Short exact quote from the text that supports this entity"
+            "evidence": "Short exact quote from the text that supports this entity",
+            "confidence": 0.95
         }
   ],
   "relations": [
@@ -24,7 +25,8 @@ Return ONLY valid JSON in this exact format:
             "predicate": "relates_to|is_part_of|created_by|requires|produces|manages|contains|uses|defines|depends_on",
             "object": "Entity B",
             "context": "Brief explanation",
-            "evidence": "Short exact quote from the text that supports this relation"
+            "evidence": "Short exact quote from the text that supports this relation",
+            "confidence": 0.9
         }
   ]
 }
@@ -36,6 +38,7 @@ Rules:
 - Use clear, descriptive predicates for relationships
 - Context should be a brief explanation of the relationship
 - evidence must be copied exactly from the provided text when possible (<= 220 chars)
+- confidence is 0.0 to 1.0: how certain you are this entity/relation is correctly extracted (1.0 = explicit in text, 0.5 = inferred, <0.3 = speculative)
 - The "language" field must reflect the language of the input text ("en" for English, "de" for German)
 - Keep all names, descriptions, and context in the ORIGINAL language of the text
 - If the text is too short or has no meaningful entities, return empty arrays
@@ -49,6 +52,24 @@ Translate: name, description, subject, object, context fields.
 
 Input JSON:
 {json_data}"""
+
+
+COREFERENCE_PROMPT = """You are a coreference resolution engine. Given a list of entity names extracted from a document, identify which names refer to the same real-world entity.
+
+Return ONLY valid JSON:
+{
+  "merges": [
+    {"canonical": "Best Name", "aliases": ["alias1", "alias2"]}
+  ]
+}
+
+Rules:
+- Merge only when you are confident they refer to the same entity
+- "the company", "it", abbreviations, acronyms, and partial names should map to their full form
+- If no merges are needed, return {"merges": []}
+
+Entity names:
+"""
 
 
 def extract_knowledge(text, chunk_size=3000):
@@ -65,13 +86,11 @@ def extract_knowledge(text, chunk_size=3000):
             continue
         relevance = score_chunk_relevance(chunk_text)
         if relevance < 0.15:
-            logger.info(
-                f"  Chunk {i+1}/{len(chunks)} skipped: low relevance score={relevance:.2f}"
-            )
+            logger.info(f"  Chunk {i+1}/{len(chunks)} skipped: relevance={relevance:.2f}")
             continue
-        logger.info(f"  Chunk {i+1}/{len(chunks)}: {len(chunk_text)} chars -> calling LLM for extraction")
+        logger.info(f"  Chunk {i+1}/{len(chunks)}: {len(chunk_text)} chars -> LLM extraction")
         entities, relations, lang = extract_from_chunk(chunk_text)
-        logger.info(f"  Chunk {i+1} result: {len(entities)} entities, {len(relations)} relations, lang={lang}")
+        logger.info(f"  Chunk {i+1} result: {len(entities)} entities, {len(relations)} relations")
         for entity in entities:
             entity["source_chunk"] = chunk["chunk_index"]
             entity["source_excerpt"] = entity.get("evidence") or chunk_text[:300]
@@ -89,20 +108,68 @@ def extract_knowledge(text, chunk_size=3000):
 
     all_entities = deduplicate_entities(all_entities)
     all_relations = normalize_and_deduplicate_relations(all_relations, all_entities)
-    logger.info(f"After dedup: {len(all_entities)} unique entities")
+
+    if len(all_entities) > 3:
+        all_entities, all_relations = resolve_coreferences(all_entities, all_relations)
+
+    logger.info(f"After dedup+coref: {len(all_entities)} unique entities")
 
     if detected_language != "en":
-        logger.info(f"Translating KG data from {detected_language} -> en")
-        all_entities, all_relations = add_translations(
-            all_entities, all_relations, detected_language, "en"
-        )
+        all_entities, all_relations = add_translations(all_entities, all_relations, detected_language, "en")
     else:
-        logger.info("Translating KG data from en -> de")
-        all_entities, all_relations = add_translations(
-            all_entities, all_relations, "en", "de"
-        )
+        all_entities, all_relations = add_translations(all_entities, all_relations, "en", "de")
 
     return all_entities, all_relations, detected_language
+
+
+def resolve_coreferences(entities, relations):
+    names = [e["name"] for e in entities]
+    if len(names) > 80:
+        names = names[:80]
+
+    prompt = COREFERENCE_PROMPT + json.dumps(names, ensure_ascii=False)
+    messages = [{"role": "user", "content": prompt}]
+    try:
+        response = llm_chat(messages, system_prompt="Return only valid JSON.")
+        response = response.strip()
+        if response.startswith("```"):
+            response = response.split("\n", 1)[1].rsplit("```", 1)[0]
+        data = json.loads(response)
+        merges = data.get("merges", [])
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return entities, relations
+
+    alias_map = {}
+    for merge in merges:
+        canonical = merge.get("canonical", "")
+        for alias in merge.get("aliases", []):
+            alias_map[alias.lower().strip()] = canonical
+
+    if not alias_map:
+        return entities, relations
+
+    logger.info(f"  Coreference resolved {len(alias_map)} alias(es)")
+    seen = {}
+    merged_entities = []
+    for e in entities:
+        resolved = alias_map.get(e["name"].lower().strip(), e["name"])
+        e["name"] = resolved
+        key = resolved.lower().strip()
+        if key not in seen:
+            seen[key] = e
+            merged_entities.append(e)
+        elif len(e.get("description", "")) > len(seen[key].get("description", "")):
+            seen[key].update(e)
+
+    for r in relations:
+        r["subject"] = alias_map.get(r["subject"].lower().strip(), r["subject"])
+        r["object"] = alias_map.get(r["object"].lower().strip(), r["object"])
+
+    relations = normalize_and_deduplicate_relations(relations, merged_entities)
+    return merged_entities, relations
+
+
+MIN_CONFIDENCE = 0.3
 
 
 def extract_from_chunk(chunk):
@@ -115,11 +182,15 @@ def extract_from_chunk(chunk):
             response = response.rsplit("```", 1)[0]
         data = json.loads(response)
         language = data.get("language", "en")
-        entities = data.get("entities", [])
-        relations = data.get("relations", [])
-        valid_entities = [e for e in entities if "name" in e and "type" in e]
-        valid_relations = [r for r in relations if "subject" in r and "predicate" in r and "object" in r]
-        return valid_entities, valid_relations, language
+        entities = [
+            e for e in data.get("entities", [])
+            if "name" in e and "type" in e and e.get("confidence", 1.0) >= MIN_CONFIDENCE
+        ]
+        relations = [
+            r for r in data.get("relations", [])
+            if "subject" in r and "predicate" in r and "object" in r and r.get("confidence", 1.0) >= MIN_CONFIDENCE
+        ]
+        return entities, relations, language
     except (json.JSONDecodeError, KeyError, TypeError):
         return [], [], "en"
 
@@ -172,14 +243,37 @@ def split_into_chunks(text, chunk_size):
     chunks = []
     overlap_sentences = 2
     overlap_units = 1
+    breadcrumb = ["", "", ""]
 
     for section in sections:
+        breadcrumb = update_breadcrumb(section, breadcrumb)
         sentence_chunks = build_chunks_from_section(section, chunk_size, overlap_sentences)
         semantic_chunks = build_semantic_chunks_from_section(section, chunk_size, overlap_units)
         section_chunks = merge_chunk_variants(sentence_chunks, semantic_chunks)
-        chunks.extend(section_chunks)
+        prefix = build_breadcrumb_prefix(breadcrumb)
+        for chunk_text in section_chunks:
+            chunks.append(f"{prefix}{chunk_text}" if prefix else chunk_text)
 
     return [{"chunk_index": i, "text": c} for i, c in enumerate(chunks)]
+
+
+def update_breadcrumb(section_text, breadcrumb):
+    for line in section_text.split("\n")[:5]:
+        stripped = line.strip()
+        if stripped.startswith("[H1] "):
+            breadcrumb = [stripped[5:], "", ""]
+        elif stripped.startswith("[H2] "):
+            breadcrumb = [breadcrumb[0], stripped[5:], ""]
+        elif stripped.startswith("[H3] "):
+            breadcrumb = [breadcrumb[0], breadcrumb[1], stripped[5:]]
+    return breadcrumb
+
+
+def build_breadcrumb_prefix(breadcrumb):
+    parts = [p for p in breadcrumb if p]
+    if not parts:
+        return ""
+    return "[Section: " + " > ".join(parts) + "]\n"
 
 
 def merge_chunk_variants(sentence_chunks, semantic_chunks):
@@ -319,7 +413,8 @@ def split_into_sections(text):
 
 def is_structure_marker(line):
     return bool(
-        re.match(r"^\[(Page\s+\d+|Slide\s+\d+|Sheet:\s+[^\]]+)\]$", line)
+        re.match(r"^\[(Page\s+\d+|Slide\s+\d+|Sheet:\s+[^\]]+|H[123]\])\s", line)
+        or re.match(r"^\[(Page\s+\d+|Slide\s+\d+|Sheet:\s+[^\]]+)\]$", line)
     )
 
 

@@ -132,6 +132,12 @@ In [ingest.py](../ingest.py), `ingest_domain()` now:
 
 Result payload includes `linked_entities` so ingestion output reflects cross-document linking activity.
 
+Domain discovery behavior in [ingest.py](../ingest.py):
+
+- domain = first-level folder under `DOCUMENTS_DIR`,
+- discovery is recursive inside each domain,
+- domains with supported files only in nested subfolders are still discovered and ingested.
+
 ## Why This Improves Answer Quality
 
 - Better chunk boundaries reduce concept fragmentation.

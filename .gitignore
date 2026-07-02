@@ -4,9 +4,14 @@ __pycache__/
 .env
 knowledge.db*
 .DS_Store
+.build-venv/
+build/
+dist/
 
 # Binary/source artifacts
 *.pdf
 
 # Current folder containing PDFs
 ubuy/
+
+.vscode
