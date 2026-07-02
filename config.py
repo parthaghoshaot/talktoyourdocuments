@@ -55,6 +55,10 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
+OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-ada-002")
+OPENAI_EMBEDDING_API_VERSION = os.getenv("OPENAI_EMBEDDING_API_VERSION", "2024-02-01")
+GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "text-embedding-004")
+OLLAMA_EMBEDDING_MODEL = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
 
 DOCUMENTS_DIR = resolve_documents_dir()
 DB_PATH = resolve_db_path()
@@ -62,6 +66,8 @@ ensure_runtime_paths(DOCUMENTS_DIR, DB_PATH)
 logger.info(f"Runtime paths: env={ENV_PATH}, documents={DOCUMENTS_DIR}, db={DB_PATH}")
 
 _llm_client = None
+_embedding_client = None
+_embedding_enabled = True
 
 
 def get_llm_client():
@@ -92,6 +98,24 @@ def get_llm_client():
         raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER}")
 
     return _llm_client
+
+
+def get_embedding_client():
+    global _embedding_client
+    if _embedding_client is not None:
+        return _embedding_client
+
+    if LLM_PROVIDER == "openai":
+        import openai
+        _embedding_client = openai.AzureOpenAI(
+            api_version=OPENAI_EMBEDDING_API_VERSION,
+            azure_endpoint=LLM_BASE_URL,
+            api_key=LLM_API_KEY,
+        )
+        return _embedding_client
+
+    _embedding_client = get_llm_client()
+    return _embedding_client
 
 
 def llm_chat(messages, system_prompt=None):
@@ -164,3 +188,52 @@ def llm_describe_image(image_bytes, mime_type="image/png", context=""):
         return response.text
 
     return ""
+
+
+def get_text_embedding(text):
+    """Return a dense embedding vector for semantic retrieval.
+
+    Uses the currently selected provider so no separate LLM service is required.
+    """
+    global _embedding_enabled
+
+    value = str(text or "").strip()
+    if not value:
+        return []
+    if not _embedding_enabled:
+        return []
+
+    client = get_embedding_client()
+
+    try:
+        if LLM_PROVIDER in ("openai", "ollama"):
+            model = OPENAI_EMBEDDING_MODEL if LLM_PROVIDER == "openai" else OLLAMA_EMBEDDING_MODEL
+            response = client.embeddings.create(model=model, input=value)
+            data = getattr(response, "data", None) or []
+            if not data:
+                return []
+            vector = getattr(data[0], "embedding", None)
+            return vector or []
+
+        if LLM_PROVIDER == "gemini":
+            response = client.models.embed_content(
+                model=GEMINI_EMBEDDING_MODEL,
+                contents=value,
+            )
+            if hasattr(response, "embeddings") and response.embeddings:
+                emb = response.embeddings[0]
+                if isinstance(emb, dict):
+                    return emb.get("values", [])
+                return getattr(emb, "values", []) or []
+            if hasattr(response, "embedding") and response.embedding:
+                emb = response.embedding
+                if isinstance(emb, dict):
+                    return emb.get("values", [])
+                return getattr(emb, "values", []) or []
+            return []
+
+        return []
+    except Exception as err:
+        logger.warning(f"Embedding request failed for provider={LLM_PROVIDER}: {err}")
+        _embedding_enabled = False
+        return []

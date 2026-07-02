@@ -13,6 +13,7 @@ from config import DOCUMENTS_DIR, llm_describe_image
 logger = logging.getLogger("talktodata.ingest")
 
 IGNORE_DIRS = {"venv", "__pycache__", ".git", "node_modules"}
+MIN_STORE_CONFIDENCE = 0.5
 
 
 def file_hash(file_path):
@@ -95,6 +96,16 @@ def ingest_domain(domain, folder_path, progress_callback=None, force=False):
             logger.info(f"  Extracting knowledge graph from: {fname} ({len(full_text)} chars)")
             entities, relations, language = extract_knowledge(full_text)
             logger.info(f"  Extracted: {len(entities)} entities, {len(relations)} relations, language={language}")
+
+            entities_before = len(entities)
+            relations_before = len(relations)
+            entities = [e for e in entities if e.get("confidence", 1.0) >= MIN_STORE_CONFIDENCE]
+            relations = [r for r in relations if r.get("confidence", 1.0) >= MIN_STORE_CONFIDENCE]
+            logger.info(
+                f"  Confidence filter @ {MIN_STORE_CONFIDENCE}: "
+                f"entities {entities_before}->{len(entities)}, relations {relations_before}->{len(relations)}"
+            )
+
             store_document(file_path, domain, fhash)
             if entities:
                 store_entities(entities, domain, file_path, language)
@@ -103,8 +114,8 @@ def ingest_domain(domain, folder_path, progress_callback=None, force=False):
             logger.info(f"  Stored in KG: {fname}")
             results["processed"] += 1
         except Exception as e:
-            logger.error(f"  Error processing {fname}: {str(e)}")
-            results["errors"].append(f"{fname}: {str(e)}")
+            logger.exception(f"  Error processing {fname}: {repr(e)}")
+            results["errors"].append(f"{fname}: {repr(e)}")
 
     try:
         linked = link_domain_entities(domain)

@@ -1,7 +1,21 @@
 from config import llm_chat
-from knowledge_graph import search_entities, search_relations, get_content_links
+from knowledge_graph import (
+    search_entities,
+    search_relations,
+    semantic_search_entities,
+    semantic_search_relations,
+    get_content_links,
+    expand_query_terms,
+    get_neighbor_relations,
+)
 import os
 import re
+import logging
+import time
+
+
+logger = logging.getLogger("talktodata.query_engine")
+MIN_RETRIEVAL_CONFIDENCE = 0.5
 
 SYSTEM_PROMPT = """You are a knowledgeable assistant that answers questions based on a knowledge graph extracted from documents.
 You will receive relevant entities and relationships from the knowledge graph as context.
@@ -11,18 +25,45 @@ Be concise and factual. When context includes source evidence, use it to justify
 
 
 def build_context(question, domain=None):
+    started_at = time.time()
     keywords = extract_keywords(question)
+    expanded_terms = expand_query_terms(keywords, domain)
+    search_terms = dedupe_text_terms(keywords + expanded_terms)
     entities = []
     relations = []
 
-    for kw in keywords:
+    logger.info(
+        f"Query retrieval terms: keywords={len(keywords)}, expanded={len(expanded_terms)}, total={len(search_terms)}"
+    )
+
+    for kw in search_terms:
         entities.extend(search_entities(kw, domain))
         relations.extend(search_relations(kw, domain))
+
+    entities.extend(semantic_search_entities(question, domain=domain, top_k=24))
+    relations.extend(semantic_search_relations(question, domain=domain, top_k=30))
+
+    entities = [e for e in entities if e.get("confidence", 1.0) >= MIN_RETRIEVAL_CONFIDENCE]
+    relations = [r for r in relations if r.get("confidence", 1.0) >= MIN_RETRIEVAL_CONFIDENCE]
 
     entities = dedupe_by_key(entities, "id")
     relations = dedupe_by_key(relations, "id")
     entities = rank_entities(question, entities)
     relations = rank_relations(question, relations)
+
+    seed_entity_names = [e.get("name", "") for e in entities[:25]]
+    if seed_entity_names:
+        neighbor_relations = get_neighbor_relations(seed_entity_names, domain=domain, max_rows=150)
+        neighbor_relations = [
+            r for r in neighbor_relations if r.get("confidence", 1.0) >= MIN_RETRIEVAL_CONFIDENCE
+        ]
+        relations.extend(neighbor_relations)
+        relations = dedupe_by_key(relations, "id")
+        relations = rank_relations(question, relations)
+
+    logger.info(
+        f"Query retrieval results: entities={len(entities)}, relations={len(relations)}"
+    )
 
     context_parts = []
     if entities:
@@ -47,8 +88,9 @@ def build_context(question, domain=None):
 
     content_links = get_content_links(domain)
     if content_links:
+        lowered_terms = [t.lower() for t in search_terms]
         relevant_links = [l for l in content_links if any(
-            kw in l.get("description", "").lower() for kw in keywords
+            kw in l.get("description", "").lower() for kw in lowered_terms
         )][:10]
         if relevant_links:
             context_parts.append("\nCROSS-REFERENCES:")
@@ -62,6 +104,9 @@ def build_context(question, domain=None):
     if not context_parts:
         context_parts.append("No relevant information found in the knowledge graph for this query.")
 
+    elapsed_ms = (time.time() - started_at) * 1000.0
+    logger.info(f"Context assembly completed in {elapsed_ms:.1f}ms")
+
     return "\n".join(context_parts), entities, relations
 
 
@@ -71,13 +116,33 @@ def extract_keywords(question):
                   "will", "about", "tell", "me", "please", "explain", "describe", "which", "where",
                   "when", "who", "why", "this", "that", "these", "those", "it", "its", "and", "or",
                   "but", "not", "no", "yes", "i", "you", "we", "they", "he", "she", "my", "your"}
-    words = question.lower().replace("?", "").replace(".", "").replace(",", "").split()
+    quoted_phrases = re.findall(r'"([^\"]{2,})"', question)
+    normalized = re.sub(r"[^a-zA-Z0-9_\-\s]", " ", question.lower())
+    words = normalized.split()
     keywords = [w for w in words if w not in stop_words and len(w) > 2]
     phrases = []
     for i in range(len(words) - 1):
-        if words[i] not in stop_words or words[i+1] not in stop_words:
+        if words[i] not in stop_words and words[i + 1] not in stop_words:
             phrases.append(f"{words[i]} {words[i+1]}")
-    return keywords + phrases[:5]
+    three_grams = []
+    for i in range(len(words) - 2):
+        if words[i] not in stop_words and words[i + 1] not in stop_words and words[i + 2] not in stop_words:
+            three_grams.append(f"{words[i]} {words[i+1]} {words[i+2]}")
+
+    terms = keywords + phrases[:8] + three_grams[:4] + [q.strip().lower() for q in quoted_phrases]
+    return dedupe_text_terms([t for t in terms if t])
+
+
+def dedupe_text_terms(terms):
+    seen = set()
+    result = []
+    for term in terms:
+        value = normalize_text(term)
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
 
 
 def dedupe_by_key(items, key):
@@ -91,16 +156,18 @@ def dedupe_by_key(items, key):
 
 
 def answer_question(question, conversation_history, domain=None):
+    started_at = time.time()
     context, entities, relations = build_context(question, domain)
     augmented_system = f"{SYSTEM_PROMPT}\n\nKNOWLEDGE GRAPH CONTEXT:\n{context}"
     messages = list(conversation_history)
     messages.append({"role": "user", "content": question})
     response = llm_chat(messages, system_prompt=augmented_system)
 
-    if needs_proof(question):
-        proof = build_proof_section(question, entities, relations)
-        if proof:
-            response = f"{response}\n\n{proof}"
+    proof = build_proof_section(question, entities, relations)
+    if proof:
+        response = f"{response}\n\n{proof}"
+    elapsed_ms = (time.time() - started_at) * 1000.0
+    logger.info(f"Answer generation completed in {elapsed_ms:.1f}ms")
     return response
 
 

@@ -33,39 +33,50 @@ with st.sidebar:
     else:
         st.write("No domain folders with documents found.")
 
-    if st.button("Ingest All Documents", type="primary"):
-        with st.spinner("Ingesting documents..."):
-            status_placeholder = st.empty()
+    if folders:
+        domain_names = [f[0] for f in folders]
+        selected_domain = st.selectbox("Select Domain", ["All"] + domain_names, key="ingest_domain_select")
 
-            def update_status(msg):
-                status_placeholder.text(msg)
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Ingest", type="primary"):
+            target = None if (not folders or selected_domain == "All") else selected_domain
+            label = f"domain '{target}'" if target else "all domains"
+            with st.spinner(f"Ingesting {label}..."):
+                status_placeholder = st.empty()
+                cb = lambda msg: status_placeholder.text(msg)
+                if target:
+                    folder_path = next(p for n, p in folders if n == target)
+                    results = {target: ingest_domain(target, folder_path, progress_callback=cb)}
+                else:
+                    results = ingest_all(progress_callback=cb)
+                status_placeholder.empty()
+                for d, r in results.items():
+                    if r["processed"] > 0:
+                        st.success(f"{d}: {r['processed']} new docs processed")
+                    if r["skipped"] > 0:
+                        st.info(f"{d}: {r['skipped']} docs skipped (already ingested)")
+                    for err in r["errors"]:
+                        st.error(f"{d}: {err}")
 
-            results = ingest_all(progress_callback=update_status)
-            status_placeholder.empty()
-
-            for domain, r in results.items():
-                if r["processed"] > 0:
-                    st.success(f"{domain}: {r['processed']} new docs processed")
-                if r["skipped"] > 0:
-                    st.info(f"{domain}: {r['skipped']} docs skipped (already ingested)")
-                for err in r["errors"]:
-                    st.error(f"{domain}: {err}")
-
-    if st.button("Re-ingest All Documents", key="reingest_btn"):
-        with st.spinner("Re-ingesting all documents (clearing existing data)..."):
-            status_placeholder = st.empty()
-
-            def update_reingest_status(msg):
-                status_placeholder.text(msg)
-
-            results = ingest_all(progress_callback=update_reingest_status, force=True)
-            status_placeholder.empty()
-
-            for domain, r in results.items():
-                if r["processed"] > 0:
-                    st.success(f"{domain}: {r['processed']} docs re-ingested")
-                for err in r["errors"]:
-                    st.error(f"{domain}: {err}")
+    with col2:
+        if st.button("Re-ingest", key="reingest_btn"):
+            target = None if (not folders or selected_domain == "All") else selected_domain
+            label = f"domain '{target}'" if target else "all domains"
+            with st.spinner(f"Re-ingesting {label} (clearing existing data)..."):
+                status_placeholder = st.empty()
+                cb = lambda msg: status_placeholder.text(msg)
+                if target:
+                    folder_path = next(p for n, p in folders if n == target)
+                    results = {target: ingest_domain(target, folder_path, progress_callback=cb, force=True)}
+                else:
+                    results = ingest_all(progress_callback=cb, force=True)
+                status_placeholder.empty()
+                for d, r in results.items():
+                    if r["processed"] > 0:
+                        st.success(f"{d}: {r['processed']} docs re-ingested")
+                    for err in r["errors"]:
+                        st.error(f"{d}: {err}")
 
     st.divider()
     st.header("Knowledge Graph Stats")

@@ -44,6 +44,22 @@ Rules:
 - If the text is too short or has no meaningful entities, return empty arrays
 - Do NOT include any text outside the JSON block"""
 
+GLEANING_PROMPT = """Review the following text and the entities/relations already extracted. Identify any MISSED entities or relationships that were not captured.
+
+Already extracted entities: {existing_entities}
+
+Return ONLY valid JSON with additional entities and relations NOT already in the list above:
+{{
+  "entities": [...],
+  "relations": [...]
+}}
+
+If nothing was missed, return {{"entities": [], "relations": []}}.
+Do NOT repeat entities/relations already extracted. Only return NEW ones.
+
+Text:
+{text}"""
+
 TRANSLATION_PROMPT = """You are a translation engine for knowledge graph data. Translate the following JSON entities and relations from {source_lang} to {target_lang}.
 
 Return ONLY valid JSON in the exact same structure, but with all text fields translated to {target_lang} and should be meaningful.
@@ -71,25 +87,39 @@ Rules:
 Entity names:
 """
 
+CHUNK_SIZE = 2400
+MIN_CONFIDENCE = 0.3
+SENTENCE_OVERLAP = 2
+SEMANTIC_OVERLAP = 1
+MIN_RELEVANCE_SCORE = 0.14
 
-def extract_knowledge(text, chunk_size=3000):
+
+def extract_knowledge(text, chunk_size=CHUNK_SIZE):
     chunks = split_into_chunks(text, chunk_size=chunk_size)
     all_entities = []
     all_relations = []
     detected_language = "en"
+    doc_summary = generate_doc_context(text)
     logger.info(f"Extracting knowledge: {len(chunks)} chunk(s), {len(text)} chars total")
 
     for i, chunk in enumerate(chunks):
         chunk_text = chunk["text"]
         source_page, source_marker = detect_source_marker(chunk_text)
-        if len(chunk_text.strip()) < 50:
+        if len(chunk_text.strip()) < 30:
             continue
         relevance = score_chunk_relevance(chunk_text)
-        if relevance < 0.15:
+        if relevance < MIN_RELEVANCE_SCORE:
             logger.info(f"  Chunk {i+1}/{len(chunks)} skipped: relevance={relevance:.2f}")
             continue
+
+        contextual_chunk = f"[Document context: {doc_summary}]\n\n{chunk_text}" if doc_summary else chunk_text
         logger.info(f"  Chunk {i+1}/{len(chunks)}: {len(chunk_text)} chars -> LLM extraction")
-        entities, relations, lang = extract_from_chunk(chunk_text)
+        entities, relations, lang = extract_from_chunk(contextual_chunk)
+
+        gleaned_e, gleaned_r = glean_missed_extractions(chunk_text, entities)
+        entities.extend(gleaned_e)
+        relations.extend(gleaned_r)
+
         logger.info(f"  Chunk {i+1} result: {len(entities)} entities, {len(relations)} relations")
         for entity in entities:
             entity["source_chunk"] = chunk["chunk_index"]
@@ -120,6 +150,61 @@ def extract_knowledge(text, chunk_size=3000):
         all_entities, all_relations = add_translations(all_entities, all_relations, "en", "de")
 
     return all_entities, all_relations, detected_language
+
+
+def generate_doc_context(text):
+    """Generate a short document-level context summary (Anthropic contextual retrieval approach)."""
+    preview = text[:3000]
+    messages = [{"role": "user", "content": f"Summarize this document in 1-2 sentences for context. What is it about?\n\n{preview}"}]
+    try:
+        response = llm_chat(messages, system_prompt="Return only a 1-2 sentence summary. No preamble.")
+        return response.strip()[:200]
+    except Exception:
+        return ""
+
+
+def glean_missed_extractions(chunk_text, existing_entities):
+    """GraphRAG gleaning: ask LLM if it missed any entities/relations."""
+    if not existing_entities:
+        return [], []
+    entity_preview = [
+        {
+            "name": e.get("name", ""),
+            "type": e.get("type", "Other"),
+            "description": e.get("description", ""),
+            "confidence": e.get("confidence", 1.0),
+        }
+        for e in existing_entities[:12]
+    ]
+    prompt = GLEANING_PROMPT.format(
+        existing_entities=json.dumps(entity_preview, ensure_ascii=False),
+        text=chunk_text,
+    )
+    messages = [{"role": "user", "content": prompt}]
+    response = ""
+    try:
+        response = llm_chat(messages, system_prompt="Return only valid JSON.")
+        response = response.strip()
+        if response.startswith("```"):
+            response = response.split("\n", 1)[1].rsplit("```", 1)[0]
+        data = json.loads(response)
+        entities = [
+            e for e in data.get("entities", [])
+            if "name" in e and "type" in e and e.get("confidence", 1.0) >= MIN_CONFIDENCE
+        ]
+        relations = [
+            r for r in data.get("relations", [])
+            if "subject" in r and "predicate" in r and "object" in r and r.get("confidence", 1.0) >= MIN_CONFIDENCE
+        ]
+        if entities or relations:
+            logger.info(f"    Gleaning found: +{len(entities)} entities, +{len(relations)} relations")
+        return entities, relations
+    except (json.JSONDecodeError, KeyError, TypeError) as err:
+        preview = response[:300].replace("\n", " ") if response else "<empty response>"
+        logger.warning(f"    Gleaning parse failed: {err}. response_preview={preview}")
+        return [], []
+
+
 
 
 def resolve_coreferences(entities, relations):
@@ -169,11 +254,9 @@ def resolve_coreferences(entities, relations):
     return merged_entities, relations
 
 
-MIN_CONFIDENCE = 0.3
-
-
 def extract_from_chunk(chunk):
     messages = [{"role": "user", "content": f"Extract knowledge graph from this text:\n\n{chunk}"}]
+    response = ""
     try:
         response = llm_chat(messages, system_prompt=EXTRACTION_PROMPT)
         response = response.strip()
@@ -191,7 +274,9 @@ def extract_from_chunk(chunk):
             if "subject" in r and "predicate" in r and "object" in r and r.get("confidence", 1.0) >= MIN_CONFIDENCE
         ]
         return entities, relations, language
-    except (json.JSONDecodeError, KeyError, TypeError):
+    except (json.JSONDecodeError, KeyError, TypeError) as err:
+        preview = response[:300].replace("\n", " ") if response else "<empty response>"
+        logger.warning(f"  Chunk extraction parse failed: {err}. response_preview={preview}")
         return [], [], "en"
 
 
@@ -210,6 +295,7 @@ def add_translations(entities, relations, source_lang, target_lang):
 
     logger.info(f"  Translation LLM call: {source_lang} -> {target_lang} ({len(entities)} entities, {len(relations)} relations)")
     messages = [{"role": "user", "content": prompt}]
+    response = ""
     try:
         response = llm_chat(messages, system_prompt="You are a precise translator. Return only valid JSON.")
         response = response.strip()
@@ -231,8 +317,9 @@ def add_translations(entities, relations, source_lang, target_lang):
                 r["object_translated"] = translated_relations[i].get("object", "")
                 r["context_translated"] = translated_relations[i].get("context", "")
 
-    except (json.JSONDecodeError, KeyError, TypeError):
-        pass
+    except (json.JSONDecodeError, KeyError, TypeError) as err:
+        preview = response[:300].replace("\n", " ") if response else "<empty response>"
+        logger.warning(f"  Translation parse failed: {err}. response_preview={preview}")
 
     return entities, relations
 
@@ -241,195 +328,24 @@ def split_into_chunks(text, chunk_size):
     normalized = normalize_text(text)
     sections = split_into_sections(normalized)
     chunks = []
-    overlap_sentences = 2
-    overlap_units = 1
     breadcrumb = ["", "", ""]
 
     for section in sections:
         breadcrumb = update_breadcrumb(section, breadcrumb)
-        sentence_chunks = build_chunks_from_section(section, chunk_size, overlap_sentences)
-        semantic_chunks = build_semantic_chunks_from_section(section, chunk_size, overlap_units)
-        section_chunks = merge_chunk_variants(sentence_chunks, semantic_chunks)
         prefix = build_breadcrumb_prefix(breadcrumb)
+        sentence_chunks = build_chunks_from_section(section, chunk_size, overlap_sentences=SENTENCE_OVERLAP)
+        semantic_chunks = build_semantic_chunks_from_section(section, chunk_size, overlap_units=SEMANTIC_OVERLAP)
+        section_chunks = merge_chunk_variants(sentence_chunks, semantic_chunks)
         for chunk_text in section_chunks:
             chunks.append(f"{prefix}{chunk_text}" if prefix else chunk_text)
 
     return [{"chunk_index": i, "text": c} for i, c in enumerate(chunks)]
 
 
-def update_breadcrumb(section_text, breadcrumb):
-    for line in section_text.split("\n")[:5]:
-        stripped = line.strip()
-        if stripped.startswith("[H1] "):
-            breadcrumb = [stripped[5:], "", ""]
-        elif stripped.startswith("[H2] "):
-            breadcrumb = [breadcrumb[0], stripped[5:], ""]
-        elif stripped.startswith("[H3] "):
-            breadcrumb = [breadcrumb[0], breadcrumb[1], stripped[5:]]
-    return breadcrumb
-
-
-def build_breadcrumb_prefix(breadcrumb):
-    parts = [p for p in breadcrumb if p]
-    if not parts:
-        return ""
-    return "[Section: " + " > ".join(parts) + "]\n"
-
-
-def merge_chunk_variants(sentence_chunks, semantic_chunks):
-    merged = []
-    for chunk in sentence_chunks:
-        chunk_text = chunk.strip()
-        if chunk_text:
-            merged.append(chunk_text)
-
-    for chunk in semantic_chunks:
-        chunk_text = chunk.strip()
-        if not chunk_text:
-            continue
-        if is_redundant_chunk(chunk_text, merged):
-            continue
-        merged.append(chunk_text)
-
-    return merged
-
-
-def is_redundant_chunk(candidate, existing_chunks):
-    candidate_norm = normalize_chunk_text(candidate)
-    if not candidate_norm:
-        return True
-
-    candidate_tokens = lexical_tokens(candidate_norm)
-    for existing in existing_chunks:
-        existing_norm = normalize_chunk_text(existing)
-        if candidate_norm == existing_norm:
-            return True
-        if candidate_norm in existing_norm or existing_norm in candidate_norm:
-            shorter = min(len(candidate_norm), len(existing_norm))
-            longer = max(len(candidate_norm), len(existing_norm))
-            if shorter / max(longer, 1) > 0.8:
-                return True
-
-        existing_tokens = lexical_tokens(existing_norm)
-        if not candidate_tokens or not existing_tokens:
-            continue
-        overlap = len(candidate_tokens.intersection(existing_tokens)) / max(len(candidate_tokens), 1)
-        if overlap > 0.92:
-            return True
-
-    return False
-
-
-def normalize_chunk_text(text):
-    value = re.sub(r"\s+", " ", str(text or "").strip().lower())
-    return value
-
-
-def deduplicate_entities(entities):
-    seen = {}
-    for e in entities:
-        key = e["name"].lower().strip()
-        if key not in seen:
-            seen[key] = e
-        else:
-            if len(e.get("description", "")) > len(seen[key].get("description", "")):
-                seen[key] = e
-    return list(seen.values())
-
-
-def normalize_text(text):
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    return text.strip()
-
-
-def split_long_paragraph(paragraph, chunk_size):
-    if len(paragraph) <= chunk_size:
-        return [paragraph]
-
-    parts = []
-    sentences = re.split(r"(?<=[.!?])\s+", paragraph)
-    current = []
-    current_len = 0
-
-    for sentence in sentences:
-        if len(sentence) > chunk_size:
-            if current:
-                parts.append(" ".join(current))
-                current = []
-                current_len = 0
-            for i in range(0, len(sentence), chunk_size):
-                parts.append(sentence[i:i + chunk_size])
-            continue
-
-        if current_len + len(sentence) + 1 > chunk_size and current:
-            parts.append(" ".join(current))
-            current = [sentence]
-            current_len = len(sentence)
-        else:
-            current.append(sentence)
-            current_len += len(sentence) + 1
-
-    if current:
-        parts.append(" ".join(current))
-
-    return parts
-
-
-def split_into_sections(text):
-    lines = text.split("\n")
-    sections = []
-    current = []
-
-    def flush_current():
-        if current:
-            section_text = "\n".join(current).strip()
-            if section_text:
-                sections.append(section_text)
-
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            if current:
-                current.append(line)
-            continue
-
-        if is_structure_marker(stripped):
-            flush_current()
-            current = [stripped]
-            continue
-
-        if current and len("\n".join(current)) > 2400 and is_heading_like(stripped):
-            flush_current()
-            current = [stripped]
-            continue
-
-        current.append(stripped)
-
-    flush_current()
-    return sections
-
-
-def is_structure_marker(line):
-    return bool(
-        re.match(r"^\[(Page\s+\d+|Slide\s+\d+|Sheet:\s+[^\]]+|H[123]\])\s", line)
-        or re.match(r"^\[(Page\s+\d+|Slide\s+\d+|Sheet:\s+[^\]]+)\]$", line)
-    )
-
-
-def is_heading_like(line):
-    if len(line) > 100:
-        return False
-    if line.endswith(":"):
-        return True
-    return bool(re.match(r"^[A-Z0-9][A-Za-z0-9 \-_/]{2,80}$", line))
-
-
 def build_chunks_from_section(section_text, chunk_size, overlap_sentences=2):
     sentences = split_into_sentences(section_text)
     if not sentences:
-        return [section_text]
+        return [section_text] if section_text.strip() else []
 
     chunks = []
     current_sentences = []
@@ -450,9 +366,9 @@ def build_chunks_from_section(section_text, chunk_size, overlap_sentences=2):
             current_len + len(sentence) + 1 > chunk_size
             or should_start_new_chunk(current_sentences, sentence, current_len, chunk_size)
         )
+
         if should_break:
-            chunk_text = " ".join(current_sentences).strip()
-            chunks.append(chunk_text)
+            chunks.append(" ".join(current_sentences).strip())
             carry = current_sentences[-overlap_sentences:] if overlap_sentences > 0 else []
             current_sentences = list(carry)
             current_len = sum(len(s) + 1 for s in current_sentences)
@@ -469,7 +385,7 @@ def build_chunks_from_section(section_text, chunk_size, overlap_sentences=2):
 def build_semantic_chunks_from_section(section_text, chunk_size, overlap_units=1):
     semantic_units = split_into_semantic_units(section_text)
     if not semantic_units:
-        return [section_text]
+        return [section_text] if section_text.strip() else []
 
     chunks = []
     current_units = []
@@ -510,6 +426,87 @@ def build_semantic_chunks_from_section(section_text, chunk_size, overlap_units=1
     return [c for c in chunks if c]
 
 
+def merge_chunk_variants(sentence_chunks, semantic_chunks):
+    merged = []
+    for chunk in sentence_chunks:
+        chunk_text = chunk.strip()
+        if chunk_text:
+            merged.append(chunk_text)
+
+    for chunk in semantic_chunks:
+        chunk_text = chunk.strip()
+        if not chunk_text:
+            continue
+        if is_redundant_chunk(chunk_text, merged):
+            continue
+        merged.append(chunk_text)
+
+    return merged
+
+
+def is_redundant_chunk(candidate, existing_chunks):
+    candidate_norm = normalize_chunk_text(candidate)
+    if not candidate_norm:
+        return True
+
+    candidate_tokens = lexical_tokens(candidate_norm)
+    for existing in existing_chunks:
+        existing_norm = normalize_chunk_text(existing)
+        if candidate_norm == existing_norm:
+            return True
+        if candidate_norm in existing_norm or existing_norm in candidate_norm:
+            shorter = min(len(candidate_norm), len(existing_norm))
+            longer = max(len(candidate_norm), len(existing_norm))
+            if shorter / max(longer, 1) > 0.82:
+                return True
+
+        existing_tokens = lexical_tokens(existing_norm)
+        if not candidate_tokens or not existing_tokens:
+            continue
+        overlap = len(candidate_tokens.intersection(existing_tokens)) / max(len(candidate_tokens), 1)
+        if overlap > 0.93:
+            return True
+
+    return False
+
+
+def normalize_chunk_text(text):
+    return re.sub(r"\s+", " ", str(text or "").strip().lower())
+
+
+def split_long_paragraph(paragraph, chunk_size):
+    if len(paragraph) <= chunk_size:
+        return [paragraph]
+
+    parts = []
+    sentences = re.split(r"(?<=[.!?])\s+", paragraph)
+    current = []
+    current_len = 0
+
+    for sentence in sentences:
+        if len(sentence) > chunk_size:
+            if current:
+                parts.append(" ".join(current))
+                current = []
+                current_len = 0
+            for i in range(0, len(sentence), chunk_size):
+                parts.append(sentence[i:i + chunk_size])
+            continue
+
+        if current_len + len(sentence) + 1 > chunk_size and current:
+            parts.append(" ".join(current))
+            current = [sentence]
+            current_len = len(sentence)
+        else:
+            current.append(sentence)
+            current_len += len(sentence) + 1
+
+    if current:
+        parts.append(" ".join(current))
+
+    return [p.strip() for p in parts if p.strip()]
+
+
 def split_into_semantic_units(text):
     lines = text.split("\n")
     units = []
@@ -542,12 +539,103 @@ def split_into_semantic_units(text):
 
 
 def should_start_new_semantic_chunk(current_tokens, next_tokens, current_len, chunk_size):
-    if current_len < max(900, int(chunk_size * 0.4)):
+    if current_len < max(900, int(chunk_size * 0.38)):
         return False
     if not current_tokens or not next_tokens:
         return False
     overlap = len(current_tokens.intersection(next_tokens)) / max(len(next_tokens), 1)
     return overlap < 0.06
+
+
+def update_breadcrumb(section_text, breadcrumb):
+    for line in section_text.split("\n")[:5]:
+        stripped = line.strip()
+        if stripped.startswith("[H1] "):
+            breadcrumb = [stripped[5:], "", ""]
+        elif stripped.startswith("[H2] "):
+            breadcrumb = [breadcrumb[0], stripped[5:], ""]
+        elif stripped.startswith("[H3] "):
+            breadcrumb = [breadcrumb[0], breadcrumb[1], stripped[5:]]
+    return breadcrumb
+
+
+def build_breadcrumb_prefix(breadcrumb):
+    parts = [p for p in breadcrumb if p]
+    if not parts:
+        return ""
+    return "[Section: " + " > ".join(parts) + "]\n"
+
+
+def deduplicate_entities(entities):
+    seen = {}
+    for e in entities:
+        key = e["name"].lower().strip()
+        if key not in seen:
+            seen[key] = e
+        else:
+            if len(e.get("description", "")) > len(seen[key].get("description", "")):
+                seen[key] = e
+    return list(seen.values())
+
+
+def normalize_text(text):
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+
+
+def split_into_sections(text):
+    lines = text.split("\n")
+    sections = []
+    current = []
+
+    def flush_current():
+        if current:
+            section_text = "\n".join(current).strip()
+            if section_text:
+                sections.append(section_text)
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if current:
+                current.append(line)
+            continue
+
+        if is_structure_marker(stripped):
+            flush_current()
+            current = [stripped]
+            continue
+
+        if current and len("\n".join(current)) > chunk_boundary() and is_heading_like(stripped):
+            flush_current()
+            current = [stripped]
+            continue
+
+        current.append(stripped)
+
+    flush_current()
+    return sections
+
+
+def chunk_boundary():
+    return CHUNK_SIZE
+
+
+def is_structure_marker(line):
+    return bool(
+        re.match(r"^\[(Page\s+\d+|Slide\s+\d+|Sheet:\s+[^\]]+|H[123]\])\s", line)
+        or re.match(r"^\[(Page\s+\d+|Slide\s+\d+|Sheet:\s+[^\]]+)\]$", line)
+    )
+
+
+def is_heading_like(line):
+    if len(line) > 100:
+        return False
+    if line.endswith(":"):
+        return True
+    return bool(re.match(r"^[A-Z0-9][A-Za-z0-9 \-_/]{2,80}$", line))
 
 
 def split_into_sentences(text):
@@ -556,7 +644,7 @@ def split_into_sentences(text):
 
 
 def should_start_new_chunk(current_sentences, next_sentence, current_len, chunk_size):
-    if current_len < max(700, int(chunk_size * 0.35)):
+    if current_len < max(700, int(chunk_size * 0.34)):
         return False
     current_tokens = lexical_tokens(" ".join(current_sentences[-5:]))
     next_tokens = lexical_tokens(next_sentence)
@@ -572,7 +660,7 @@ def lexical_tokens(text):
 
 def score_chunk_relevance(chunk_text):
     tokens = re.findall(r"[A-Za-z0-9_]+", chunk_text)
-    if len(tokens) < 20:
+    if len(tokens) < 18:
         return 0.0
 
     unique_ratio = len(set(t.lower() for t in tokens)) / max(len(tokens), 1)
@@ -583,7 +671,7 @@ def score_chunk_relevance(chunk_text):
     for line in lines:
         if is_structure_marker(line) or is_heading_like(line):
             marker_lines += 1
-    marker_penalty = min(marker_lines / max(len(lines), 1), 0.35)
+    marker_penalty = min(marker_lines / max(len(lines), 1), 0.33)
 
     score = (0.55 * unique_ratio) + (0.45 * alpha_ratio) - marker_penalty
     return max(0.0, min(score, 1.0))
